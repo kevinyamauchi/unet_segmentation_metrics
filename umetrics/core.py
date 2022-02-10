@@ -37,6 +37,17 @@ def _find_matches(ref, pred):
     return matches
 
 
+def _calc_iou(ref, pred, binarize=True):
+    if binarize is True:
+        ref = ref > 0
+        pred = pred > 0
+
+    intersection = np.logical_and(ref, pred)
+    union = np.logical_or(ref, pred)
+
+    return np.sum(intersection) / np.sum(union)
+
+
 def find_matches(ref, pred):
     """ Find matches between the reference image and the predicted image.
 
@@ -44,7 +55,6 @@ def find_matches(ref, pred):
         ref
         pred
     """
-
     # do forward and reverse matching
     matches_rp = _find_matches(ref, pred)
     matches_pr = _find_matches(pred, ref)
@@ -52,6 +62,8 @@ def find_matches(ref, pred):
     true_matches = []
     in_ref_only = []
     in_pred_only = []
+    potential_merges = dict()
+    potential_splits = dict()
 
     for m0, match in matches_rp.items():
         # no matches
@@ -65,10 +77,62 @@ def find_matches(ref, pred):
                 # one to one
                 true_matches.append((m0, match[0]))
             elif len(matches_pr[match[0]]) > 1:
-                # two (or more) objects in the prediction match one in the ref
-                in_pred_only += match
+                # two (or more) objects in the ref match one in the pred
+                # (merge event)
+                pred_index = match[0]
+                ref_matches = matches_pr[pred_index]
+                if not (pred_index in potential_merges):
+                    potential_merges[pred_index] = ref_matches
+                else:
+                    merged_indices = potential_merges[pred_index]
+                    merged_indices += ref_matches
+                    deduplicated_merged_indices = list(set(merged_indices))
+                    potential_merges[pred_index] = deduplicated_merged_indices
         elif len(match) > 1:
-            in_pred_only += match
+            ref_index = m0
+            pred_matches = match
+            if not (ref_index in potential_splits):
+                potential_splits[ref_index] = pred_matches
+            else:
+                split_indices = potential_splits[ref_index]
+                split_indices += pred_matches
+                deduplicated_split_indices = list(set(split_indices))
+                potential_splits[ref_index] = deduplicated_split_indices
+
+    merges = []
+    if len(potential_merges) > 0:
+        # multiple reference objects assigned to single pred object
+        # (undersegmentation)
+        for pred_index, merge_ref_indices in potential_merges.items():
+            match_ious = []
+            for ref_index in merge_ref_indices:
+                # get IOUs of the matches
+                ref_mask = ref.labeled == ref_index
+                pred_mask = pred.labeled == pred_index
+
+                match_ious.append(_calc_iou(ref_mask, pred_mask))
+
+            if np.any(np.asarray(match_ious) > 0.1):
+                merges.append((pred_index, merge_ref_indices))
+            else:
+                in_ref_only += merge_ref_indices
+                in_pred_only.append(pred_index)
+
+    splits = []
+    if len(potential_splits) > 0:
+        # multiple prediction objects for single ref object
+        for ref_index, split_pred_indices in potential_splits.items():
+            match_ious = []
+            for pred_index in split_pred_indices:
+                # get IOUs of matches
+                ref_mask = ref.labeled == ref_index
+                pred_mask = pred.labeled == pred_index
+                match_ious.append(_calc_iou(ref_mask, pred_mask))
+            if np.any(np.asarray(match_ious) > 0.1):
+                splits.append((ref_index, split_pred_indices))
+            else:
+                in_ref_only.append(ref_index)
+                in_pred_only += split_pred_indices
 
     # sanity check that all are accounted for
     ref_found_labels = set(in_ref_only + [m[0] for m in true_matches])
@@ -78,9 +142,13 @@ def find_matches(ref, pred):
     assert( len(pred_found_labels.difference(set(pred.labels))) == 0 )
 
     # return a dictionary of found matches
-    matches = {'true_matches': true_matches,
-               'in_ref_only': list(set(in_ref_only)),
-               'in_pred_only': list(set(in_pred_only))}
+    matches = {
+        'true_matches': true_matches,
+        'in_ref_only': list(set(in_ref_only)),
+        'in_pred_only': list(set(in_pred_only)),
+        'merge_errors': merges,
+        'split_errors': splits
+    }
     return matches
 
 
@@ -236,6 +304,7 @@ class SegmentationMetrics:
 
             self._matches['true_matches'] = tp
             self._matches['in_pred_only'] += [m[1] for m in fp]
+            self._matches['in_ref_only'] += [m[0] for m in fp]
 
     @property
     def strict(self):
@@ -279,6 +348,14 @@ class SegmentationMetrics:
     def false_positives(self):
         """ combination of non unique matches and unmatched objects """
         return self._matches['in_pred_only']
+
+    @property
+    def merge_errors(self):
+        return self._matches['merge_errors']
+
+    @property
+    def split_errors(self):
+        return self._matches['split_errors']
 
     @property
     def n_true_positives(self): return len(self.true_positives)
